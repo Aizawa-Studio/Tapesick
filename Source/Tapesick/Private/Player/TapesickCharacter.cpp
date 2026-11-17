@@ -7,23 +7,25 @@
 #include "EnhancedInputComponent.h"
 #include "EnhancedInputSubsystems.h"
 #include "Engine/LocalPlayer.h"
+#include "Engine/World.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/SpringArmComponent.h"
 #include "InputAction.h"
 #include "InputActionValue.h"
+#include "Player/InteractableInterface.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogTapesickCharacter, Log, All);
 
 namespace TapesickCharacterConstants
 {
-	/** Порог «персонаж действительно движется», см/с: иначе стамина тратилась бы в стену. */
+	/** Порог «персонаж действительно движется», см/с. */
 	constexpr float MovingSpeedThreshold = 10.f;
 
 	/** Гистерезис, чтобы не спамить UI одинаковыми значениями стамины. */
 	constexpr float StaminaBroadcastEpsilon = 0.01f;
 
-	/** Капсула игрока по ТЗ: радиус 34, половина высоты 90. */
+	/** Капсула игрока по ТЗ. */
 	constexpr float CapsuleRadius = 34.f;
 	constexpr float CapsuleHalfHeight = 90.f;
 	constexpr float CrouchedHalfHeight = 60.f;
@@ -31,15 +33,12 @@ namespace TapesickCharacterConstants
 
 ATapesickCharacter::ATapesickCharacter()
 {
-	// Tick нужен стамине и бленду камеры; сам расчёт дешёвый (ранние выходы).
 	PrimaryActorTick.bCanEverTick = true;
 
-	// Капсула: дефолты в C++, BP их не переопределяет.
 	GetCapsuleComponent()->InitCapsuleSize(
 		TapesickCharacterConstants::CapsuleRadius,
 		TapesickCharacterConstants::CapsuleHalfHeight);
 
-	// Вид от первого лица: yaw за контроллером, pitch/roll — нет.
 	bUseControllerRotationPitch = false;
 	bUseControllerRotationYaw = true;
 	bUseControllerRotationRoll = false;
@@ -48,7 +47,6 @@ ATapesickCharacter::ATapesickCharacter()
 	Movement->bOrientRotationToMovement = false;
 	Movement->bUseControllerDesiredRotation = false;
 
-	// Присед разрешён, прыжка нет — на уровне навигационного агента.
 	FNavAgentProperties& NavAgent = Movement->GetNavAgentPropertiesRef();
 	NavAgent.bCanCrouch = true;
 	NavAgent.bCanJump = false;
@@ -61,7 +59,7 @@ ATapesickCharacter::ATapesickCharacter()
 	Movement->JumpZVelocity = 0.f;
 	Movement->AirControl = 0.f;
 
-	// SpringArm без длины и без коллизии = первое лицо, вращается контроллером.
+	// SpringArm без длины и коллизии = первое лицо.
 	CameraBoom = CreateDefaultSubobject<USpringArmComponent>(TEXT("CameraBoom"));
 	CameraBoom->SetupAttachment(GetCapsuleComponent());
 	CameraBoom->SetRelativeLocation(FVector(
@@ -103,17 +101,17 @@ void ATapesickCharacter::Tick(float DeltaSeconds)
 	UpdateStamina(DeltaSeconds);
 	UpdateMovementState();
 	UpdateCameraHeight(DeltaSeconds);
+	UpdateInteractionTarget(DeltaSeconds);
 }
 
 // ---------------------------------------------------------------------------
-// Ввод (Enhanced Input)
+// Ввод
 // ---------------------------------------------------------------------------
 
 void ATapesickCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
 {
 	Super::SetupPlayerInputComponent(PlayerInputComponent);
 
-	// Контекст живёт на персонаже (Class Defaults BP_TapesickCharacter), добавляем при поссинге.
 	if (APlayerController* PC = Cast<APlayerController>(GetController()))
 	{
 		if (UEnhancedInputLocalPlayerSubsystem* Subsystem =
@@ -126,7 +124,8 @@ void ATapesickCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputC
 			else
 			{
 				UE_LOG(LogTapesickCharacter, Warning,
-					TEXT("%s: DefaultMappingContext is not set (BP_TapesickCharacter -> Class Defaults -> Tapesick|Input)."), *GetName());
+					TEXT("%s: DefaultMappingContext is not set (BP_TapesickCharacter -> Class Defaults -> Tapesick|Input)."),
+					*GetName());
 			}
 		}
 	}
@@ -135,7 +134,8 @@ void ATapesickCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputC
 	if (!EnhancedInput)
 	{
 		UE_LOG(LogTapesickCharacter, Error,
-			TEXT("%s: EnhancedInputComponent not found. Check DefaultInputComponentClass in DefaultInput.ini."), *GetName());
+			TEXT("%s: EnhancedInputComponent not found. Check DefaultInputComponentClass in DefaultInput.ini."),
+			*GetName());
 		return;
 	}
 
@@ -157,13 +157,15 @@ void ATapesickCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputC
 		EnhancedInput->BindAction(CrouchAction, ETriggerEvent::Started, this, &ATapesickCharacter::CrouchStarted);
 		EnhancedInput->BindAction(CrouchAction, ETriggerEvent::Completed, this, &ATapesickCharacter::CrouchCompleted);
 	}
+	if (InteractAction)
+	{
+		EnhancedInput->BindAction(InteractAction, ETriggerEvent::Started, this, &ATapesickCharacter::InteractPressed);
+	}
 }
 
 void ATapesickCharacter::Move(const FInputActionValue& Value)
 {
 	const FVector2D MovementVector = Value.Get<FVector2D>();
-
-	// Кэш нужен проверке «куда разрешён спринт» (X = вправо, Y = вперёд).
 	LastMoveInput = MovementVector;
 
 	if (!Controller)
@@ -208,7 +210,6 @@ void ATapesickCharacter::CrouchStarted()
 	}
 	else
 	{
-		// Удержание: присели, пока клавиша зажата (классический survival horror).
 		Crouch();
 	}
 }
@@ -217,8 +218,6 @@ void ATapesickCharacter::CrouchCompleted()
 {
 	if (!bCrouchToggle)
 	{
-		// Отпустили клавишу — встаём. Если над головой препятствие, CMC не даст встать
-		// и повторно попробует сам, как только место освободится.
 		UnCrouch();
 	}
 }
@@ -229,7 +228,8 @@ void ATapesickCharacter::CrouchCompleted()
 
 bool ATapesickCharacter::IsMoving() const
 {
-	return GetVelocity().SizeSquared2D() > FMath::Square(TapesickCharacterConstants::MovingSpeedThreshold);
+	return GetVelocity().SizeSquared2D() >
+		FMath::Square(TapesickCharacterConstants::MovingSpeedThreshold);
 }
 
 bool ATapesickCharacter::CanSprint() const
@@ -239,8 +239,6 @@ bool ATapesickCharacter::CanSprint() const
 		return false;
 	}
 
-	// Ввод в control-space: X — вправо, Y — вперёд.
-	// SprintMinForwardDot = 0 → спринт разрешён вперёд, боком и по диагонали вперёд, но не назад.
 	const FVector2D MoveInput = LastMoveInput.GetSafeNormal();
 	if (MoveInput.IsNearlyZero())
 	{
@@ -269,7 +267,8 @@ void ATapesickCharacter::UpdateStamina(float DeltaSeconds)
 		{
 			bExhausted = true;
 			UE_LOG(LogTapesickCharacter, Log,
-				TEXT("%s: exhausted, sprint blocked until stamina >= %.0f."), *GetName(), RecoverThreshold);
+				TEXT("%s: exhausted, sprint blocked until stamina >= %.0f."),
+				*GetName(), RecoverThreshold);
 		}
 	}
 	else
@@ -278,7 +277,9 @@ void ATapesickCharacter::UpdateStamina(float DeltaSeconds)
 
 		if (TimeSinceLastStaminaDrain >= StaminaRegenDelay && Stamina < StaminaMax)
 		{
-			const float RegenRate = (IsCrouched() || !IsMoving()) ? StaminaRegenIdle : StaminaRegenWalking;
+			const float RegenRate =
+				(IsCrouched() || !IsMoving()) ? StaminaRegenIdle : StaminaRegenWalking;
+
 			Stamina = FMath::Min(StaminaMax, Stamina + RegenRate * DeltaSeconds);
 		}
 	}
@@ -294,7 +295,10 @@ void ATapesickCharacter::UpdateStamina(float DeltaSeconds)
 
 void ATapesickCharacter::BroadcastStamina(bool bForce)
 {
-	if (!bForce && FMath::IsNearlyEqual(Stamina, LastBroadcastStamina, TapesickCharacterConstants::StaminaBroadcastEpsilon))
+	if (!bForce && FMath::IsNearlyEqual(
+		Stamina,
+		LastBroadcastStamina,
+		TapesickCharacterConstants::StaminaBroadcastEpsilon))
 	{
 		return;
 	}
@@ -318,7 +322,6 @@ void ATapesickCharacter::UpdateMovementState()
 
 	if (IsCrouched())
 	{
-		// Присед приоритетнее всего: он и отменяет спринт.
 		NewState = ETapesickMovementState::Crouch;
 		TargetSpeed = CrouchSpeed;
 	}
@@ -357,7 +360,9 @@ void ATapesickCharacter::SetMovementState(ETapesickMovementState NewState)
 	MovementState = NewState;
 
 	UE_LOG(LogTapesickCharacter, Log, TEXT("%s: movement state -> %s"),
-		*GetName(), *StaticEnum<ETapesickMovementState>()->GetNameStringByValue(static_cast<int64>(MovementState)));
+		*GetName(),
+		*StaticEnum<ETapesickMovementState>()->GetNameStringByValue(
+			static_cast<int64>(MovementState)));
 
 	OnMovementStateChanged.Broadcast(MovementState);
 	BP_OnMovementStateChanged(MovementState);
@@ -374,7 +379,6 @@ void ATapesickCharacter::UpdateCameraHeight(float DeltaSeconds)
 		return;
 	}
 
-	// Блендим долю приседа (0..1), а не мировую высоту: тогда камера не дёргается на ступеньках.
 	const float TargetAlpha = IsCrouched() ? 1.f : 0.f;
 
 	if (CameraBlendTime <= KINDA_SMALL_NUMBER)
@@ -383,12 +387,135 @@ void ATapesickCharacter::UpdateCameraHeight(float DeltaSeconds)
 	}
 	else
 	{
-		CrouchCameraAlpha = FMath::FInterpConstantTo(CrouchCameraAlpha, TargetAlpha, DeltaSeconds, 1.f / CameraBlendTime);
+		CrouchCameraAlpha = FMath::FInterpConstantTo(
+			CrouchCameraAlpha,
+			TargetAlpha,
+			DeltaSeconds,
+			1.f / CameraBlendTime);
 	}
 
-	const float EyeHeightFromFeet = FMath::Lerp(CameraHeightStanding, CameraCrouched, CrouchCameraAlpha);
+	const float EyeHeightFromFeet =
+		FMath::Lerp(CameraHeightStanding, CameraCrouched, CrouchCameraAlpha);
 
 	FVector BoomLocation = CameraBoom->GetRelativeLocation();
 	BoomLocation.Z = EyeHeightFromFeet - GetCapsuleComponent()->GetScaledCapsuleHalfHeight();
 	CameraBoom->SetRelativeLocation(BoomLocation);
+}
+
+// ---------------------------------------------------------------------------
+// Взаимодействие
+// ---------------------------------------------------------------------------
+
+void ATapesickCharacter::InteractPressed()
+{
+	TryInteract();
+}
+
+void ATapesickCharacter::TryInteract()
+{
+	// На нажатие выполняем свежий trace, а не используем цель из прошлого кадра.
+	AActor* Target = FindInteractionTarget();
+	if (!Target)
+	{
+		return;
+	}
+
+	if (!Cast<IInteractableInterface>(Target))
+	{
+		return;
+	}
+
+	if (!IInteractableInterface::Execute_CanInteract(Target, this))
+	{
+		UE_LOG(LogTapesickCharacter, Verbose,
+			TEXT("%s: %s refused interaction (CanInteract = false)."),
+			*GetName(), *Target->GetName());
+		return;
+	}
+
+	UE_LOG(LogTapesickCharacter, Log,
+		TEXT("%s: interact with %s."),
+		*GetName(), *Target->GetName());
+
+	IInteractableInterface::Execute_Interact(Target, this);
+}
+
+AActor* ATapesickCharacter::FindInteractionTarget() const
+{
+	if (!FollowCamera || !GetWorld())
+	{
+		return nullptr;
+	}
+
+	const FVector Start = FollowCamera->GetComponentLocation();
+	const FVector End = Start + FollowCamera->GetForwardVector() * InteractDistance;
+	const FCollisionShape Shape = FCollisionShape::MakeSphere(InteractTraceRadius);
+
+	// Первый блокирующий hit: стена или другой проп перекрывает взаимодействие.
+	FCollisionQueryParams Params(SCENE_QUERY_STAT(TapesickInteract), false, this);
+
+	FHitResult Hit;
+	if (!GetWorld()->SweepSingleByChannel(
+		Hit,
+		Start,
+		End,
+		FQuat::Identity,
+		InteractTraceChannel,
+		Shape,
+		Params))
+	{
+		return nullptr;
+	}
+
+	AActor* HitActor = Hit.GetActor();
+	if (!HitActor || !Cast<IInteractableInterface>(HitActor))
+	{
+		return nullptr;
+	}
+
+	return HitActor;
+}
+
+void ATapesickCharacter::UpdateInteractionTarget(float DeltaSeconds)
+{
+	if (InteractTargetUpdateInterval > 0.f)
+	{
+		TimeSinceInteractionTargetUpdate += DeltaSeconds;
+
+		if (TimeSinceInteractionTargetUpdate < InteractTargetUpdateInterval)
+		{
+			return;
+		}
+
+		TimeSinceInteractionTargetUpdate = 0.f;
+	}
+
+	AActor* NewTarget = FindInteractionTarget();
+
+	// Подсказку вычисляем заранее и сохраняем ДО Broadcast:
+	// BP-подписчик должен получить текст именно новой цели.
+	FText NewPrompt = FText::GetEmpty();
+
+	if (NewTarget && IInteractableInterface::Execute_CanInteract(NewTarget, this))
+	{
+		NewPrompt = IInteractableInterface::Execute_GetInteractionPrompt(NewTarget);
+	}
+
+	const bool bTargetChanged = NewTarget != InteractionTarget.Get();
+
+	InteractionTarget = NewTarget;
+	InteractionPrompt = NewPrompt;
+
+	if (!bTargetChanged)
+	{
+		return;
+	}
+
+	UE_LOG(LogTapesickCharacter, Verbose,
+		TEXT("%s: interaction target -> %s"),
+		*GetName(),
+		NewTarget ? *NewTarget->GetName() : TEXT("none"));
+
+	OnInteractionTargetChanged.Broadcast(NewTarget);
+	BP_OnInteractionTargetChanged(NewTarget);
 }
