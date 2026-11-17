@@ -7,10 +7,10 @@
 
 ATapesickGameMode::ATapesickGameMode()
 {
-	// GameState по “« идЄт без BP-обЄртки Ч задаЄм классом в C++.
+	// GameState без BP-обЄртки: назначаем класс напр€мую в C++.
 	GameStateClass = ATapesickGameState::StaticClass();
 
-	// BP_TapesickGameMode переопределит это на BP_TapesickPlayerController;
-	// значение нужно как безопасный дефолт дл€ C++-спавна.
+	// BP_TapesickGameMode может переопределить контроллер на BP_TapesickPlayerController.
+	// Ѕазовый C++ класс контроллера указываем здесь.
 	PlayerControllerClass = ATapesickPlayerController::StaticClass();
 }

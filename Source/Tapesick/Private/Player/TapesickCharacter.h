@@ -6,6 +6,7 @@
 #include "GameFramework/Character.h"
 #include "TapesickCharacter.generated.h"
 
+class AActor;
 class UCameraComponent;
 class UInputAction;
 class UInputMappingContext;
@@ -25,10 +26,11 @@ enum class ETapesickMovementState : uint8
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FTapesickMovementStateChanged, ETapesickMovementState, NewState);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FTapesickStaminaChanged, float, CurrentStamina, float, MaxStamina);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FTapesickInteractionTargetChanged, AActor*, NewTarget);
 
 /**
  * Игрок Tapesick: вид от первого лица, присед, спринт со стаминой, без прыжка.
- * Вся математика движения/стамины — здесь; ассеты ввода и визуал — в BP.
+ * Математика движения/стамины и interaction trace — здесь; ассеты и визуал — в BP.
  */
 UCLASS()
 class TAPESICK_API ATapesickCharacter : public ACharacter
@@ -56,13 +58,29 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Tapesick|Player")
 	bool IsExhausted() const { return bExhausted; }
 
-	/** Для UI: смена состояния. */
+	/** F: взаимодействие с тем, на что смотрит камера. */
+	UFUNCTION(BlueprintCallable, Category = "Tapesick|Interaction")
+	void TryInteract();
+
+	/** Актор, на который сейчас наведена камера. */
+	UFUNCTION(BlueprintPure, Category = "Tapesick|Interaction")
+	AActor* GetInteractionTarget() const { return InteractionTarget.Get(); }
+
+	/** Подсказка текущей цели. Пусто, если взаимодействие недоступно. */
+	UFUNCTION(BlueprintPure, Category = "Tapesick|Interaction")
+	FText GetInteractionPrompt() const { return InteractionPrompt; }
+
+	/** Для UI: смена состояния движения. */
 	UPROPERTY(BlueprintAssignable, Category = "Tapesick|Player")
 	FTapesickMovementStateChanged OnMovementStateChanged;
 
 	/** Для UI: стамина изменилась. */
 	UPROPERTY(BlueprintAssignable, Category = "Tapesick|Player")
 	FTapesickStaminaChanged OnStaminaChanged;
+
+	/** Для UI: изменилась цель взаимодействия, в том числе на nullptr. */
+	UPROPERTY(BlueprintAssignable, Category = "Tapesick|Interaction")
+	FTapesickInteractionTargetChanged OnInteractionTargetChanged;
 
 protected:
 	virtual void BeginPlay() override;
@@ -83,21 +101,19 @@ protected:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Tapesick|Locomotion", meta = (ClampMin = "0.0", Units = "cm/s"))
 	float ExhaustedSpeed = 120.f;
 
-	/** false — присед по удержанию (как в классических survival horror), true — переключение по нажатию. */
+	/** false — присед по удержанию, true — переключение по нажатию. */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Tapesick|Locomotion")
 	bool bCrouchToggle = false;
 
 	/**
-	 * Минимальная проекция нормализованного ввода на «вперёд», при которой разрешён спринт.
-	 *  0.0  — разрешено всё, кроме движения назад (боком и вперёд можно);
-	 *  0.64 — только вперёд (cos 50°), как было раньше;
-	 * -1.0  — любое направление, включая назад.
+	 * Минимальная проекция нормализованного ввода на «вперёд» для спринта.
+	 * 0 — всё, кроме движения назад; 0.64 — только вперёд; -1 — любое направление.
 	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Tapesick|Locomotion", meta = (ClampMin = "-1.0", ClampMax = "1.0"))
 	float SprintMinForwardDot = 0.f;
 
 	// ------------------------------------------------------------------
-	// Настройка: камера (высоты — от ступней, см)
+	// Настройка: камера
 	// ------------------------------------------------------------------
 
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Tapesick|Camera", meta = (ClampMin = "0.0", Units = "cm"))
@@ -106,7 +122,6 @@ protected:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Tapesick|Camera", meta = (ClampMin = "0.0", Units = "cm"))
 	float CameraCrouched = 105.f;
 
-	/** Время бленда камеры при приседе, с. */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Tapesick|Camera", meta = (ClampMin = "0.0", Units = "s"))
 	float CameraBlendTime = 0.25f;
 
@@ -129,12 +144,31 @@ protected:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Tapesick|Stamina", meta = (ClampMin = "0.0"))
 	float StaminaRegenIdle = 20.f;
 
-	/** Порог, после которого снимается блок спринта (Exhausted). */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Tapesick|Stamina", meta = (ClampMin = "0.0"))
 	float ExhaustedRecoverThreshold = 40.f;
 
 	// ------------------------------------------------------------------
-	// Настройка: ввод (ассеты создаются в BP, назначаются в Class Defaults)
+	// Настройка: взаимодействие
+	// ------------------------------------------------------------------
+
+	/** Дальность взаимодействия от камеры, см. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Tapesick|Interaction", meta = (ClampMin = "0.0", Units = "cm"))
+	float InteractDistance = 200.f;
+
+	/** Радиус сферического свипа: прощает неточность прицела. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Tapesick|Interaction", meta = (ClampMin = "0.0", Units = "cm"))
+	float InteractTraceRadius = 8.f;
+
+	/** ECC_GameTraceChannel2 = Interaction из DefaultEngine.ini. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Tapesick|Interaction")
+	TEnumAsByte<ECollisionChannel> InteractTraceChannel = ECC_GameTraceChannel2;
+
+	/** Как часто пересчитывать цель, с; 0 — каждый кадр. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Tapesick|Interaction", meta = (ClampMin = "0.0", Units = "s"))
+	float InteractTargetUpdateInterval = 0.1f;
+
+	// ------------------------------------------------------------------
+	// Настройка: ввод
 	// ------------------------------------------------------------------
 
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Tapesick|Input")
@@ -152,6 +186,9 @@ protected:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Tapesick|Input")
 	TObjectPtr<UInputAction> CrouchAction;
 
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Tapesick|Input")
+	TObjectPtr<UInputAction> InteractAction;
+
 	// ------------------------------------------------------------------
 	// События для BP
 	// ------------------------------------------------------------------
@@ -162,8 +199,11 @@ protected:
 	UFUNCTION(BlueprintImplementableEvent, Category = "Tapesick|Player", meta = (DisplayName = "On Stamina Changed"))
 	void BP_OnStaminaChanged(float CurrentStamina, float MaxStamina);
 
+	UFUNCTION(BlueprintImplementableEvent, Category = "Tapesick|Interaction", meta = (DisplayName = "On Interaction Target Changed"))
+	void BP_OnInteractionTargetChanged(AActor* NewTarget);
+
 	// ------------------------------------------------------------------
-	// Компоненты камеры (создаются в C++, видны в BP)
+	// Компоненты камеры
 	// ------------------------------------------------------------------
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Tapesick|Camera")
@@ -180,6 +220,7 @@ private:
 	void SprintCompleted();
 	void CrouchStarted();
 	void CrouchCompleted();
+	void InteractPressed();
 
 	// --- Внутренняя логика ---
 	void UpdateStamina(float DeltaSeconds);
@@ -190,6 +231,9 @@ private:
 
 	bool IsMoving() const;
 	bool CanSprint() const;
+
+	AActor* FindInteractionTarget() const;
+	void UpdateInteractionTarget(float DeltaSeconds);
 
 	// --- Состояние ---
 	FVector2D LastMoveInput = FVector2D::ZeroVector;
@@ -205,4 +249,8 @@ private:
 	bool bExhausted = false;
 
 	ETapesickMovementState MovementState = ETapesickMovementState::Idle;
+
+	TWeakObjectPtr<AActor> InteractionTarget;
+	FText InteractionPrompt;
+	float TimeSinceInteractionTargetUpdate = 0.f;
 };
