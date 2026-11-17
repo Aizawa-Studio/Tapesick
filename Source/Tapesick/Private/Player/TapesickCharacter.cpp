@@ -420,7 +420,7 @@ void ATapesickCharacter::TryInteract()
 		return;
 	}
 
-	if (!Cast<IInteractableInterface>(Target))
+	if (!Target->GetClass()->ImplementsInterface(UInteractableInterface::StaticClass()))
 	{
 		return;
 	}
@@ -468,7 +468,9 @@ AActor* ATapesickCharacter::FindInteractionTarget() const
 	}
 
 	AActor* HitActor = Hit.GetActor();
-	if (!HitActor || !Cast<IInteractableInterface>(HitActor))
+
+	if (!HitActor ||
+		!HitActor->GetClass()->ImplementsInterface(UInteractableInterface::StaticClass()))
 	{
 		return nullptr;
 	}
