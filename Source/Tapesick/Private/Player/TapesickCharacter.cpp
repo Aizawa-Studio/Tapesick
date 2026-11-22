@@ -1,6 +1,7 @@
 // Fill out your copyright notice in the Description page of Project Settings.
 
 #include "Player/TapesickCharacter.h"
+#include "Player/TapesickInventoryComponent.h"
 
 #include "Camera/CameraComponent.h"
 #include "Components/CapsuleComponent.h"
@@ -33,6 +34,7 @@ namespace TapesickCharacterConstants
 
 ATapesickCharacter::ATapesickCharacter()
 {
+	CreateDefaultSubobject<UTapesickInventoryComponent>(TEXT("InventoryComponent"));
 	PrimaryActorTick.bCanEverTick = true;
 
 	GetCapsuleComponent()->InitCapsuleSize(
